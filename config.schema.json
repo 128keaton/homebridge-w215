@@ -1,33 +1,61 @@
 {
   "pluginAlias": "DSP-W215",
   "pluginType": "accessory",
-  "singular": true,
+  "singular": false,
+  "headerDisplay": "Controls a D-Link DSP-W215 smart plug: on/off, temperature and (in Eve) power consumption. Add one entry per plug.",
   "schema": {
     "type": "object",
+    "required": [
+      "name",
+      "host",
+      "password"
+    ],
     "properties": {
       "name": {
         "title": "Name",
         "type": "string",
-        "required": true,
         "default": "DSP-W215"
       },
       "host": {
         "title": "Host",
         "type": "string",
-        "required": true,
-        "placeholder": "0.0.0.0"
+        "description": "IP address or hostname of the plug. Give it a static/reserved IP address in your router.",
+        "placeholder": "192.168.1.50"
       },
       "username": {
         "title": "Username",
         "type": "string",
-        "required": true,
         "default": "admin"
       },
       "password": {
         "title": "Device PIN",
         "type": "string",
-        "required": true,
+        "description": "The PIN printed on the back of the plug (or the password you set in its web interface).",
         "placeholder": "000000"
+      },
+      "pollingInterval": {
+        "title": "Polling interval (seconds)",
+        "type": "integer",
+        "default": 15,
+        "minimum": 5,
+        "description": "How often the plug is queried, so changes made with its physical button show up in HomeKit."
+      },
+      "timeout": {
+        "title": "Request timeout (seconds)",
+        "type": "integer",
+        "default": 5,
+        "minimum": 1
+      },
+      "disableTemperature": {
+        "title": "Hide temperature sensor",
+        "type": "boolean",
+        "default": false
+      },
+      "disablePowerMeter": {
+        "title": "Disable power consumption",
+        "type": "boolean",
+        "default": false,
+        "description": "Power draw is shown in Eve and used for the Home app's \"in use\" indicator."
       }
     }
   }

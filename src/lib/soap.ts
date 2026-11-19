@@ -1,317 +1,324 @@
-import request from 'then-request';
-import {DOMParser} from 'xmldom';
-import {HNAPMethod, HNAPResponse} from '../enum';
-import {HMACMD5} from './hmac-md5';
-import {InternetSettings} from '../type/internet-settings.type';
+import {createHmac} from 'node:crypto';
+import {HNAPMethod} from '../enum/index.js';
+import type {DeviceInfo} from '../type/device-info.type.js';
+import {escapeXml, readBlocks, readTag} from './xml.js';
 
 const HNAP1_XMLNS = 'http://purenetworks.com/HNAP1/';
-const HNAP_METHOD = 'POST';
-const HNAP_BODY_ENCODING = 'UTF8';
+const SOCKET_MODULE_ID = 1;
+const MAX_LOGGED_BODY = 500;
+
+export const DEFAULT_TIMEOUT_MS = 5000;
+
+/**
+ * network  - the plug could not be reached, or did not answer in time
+ * auth     - the plug rejected the username/PIN
+ * protocol - the plug answered, but not with something we understand (or reported an error)
+ */
+export type HnapErrorKind = 'network' | 'auth' | 'protocol';
+
+export class HnapError extends Error {
+  constructor(
+    message: string,
+    public readonly kind: HnapErrorKind,
+  ) {
+    super(message);
+    this.name = 'HnapError';
+  }
+}
+
+export interface SoapLogger {
+  debug(message: string): void;
+}
+
+export interface SoapClientOptions {
+  url: string;
+  password: string;
+  username?: string;
+  timeoutMs?: number;
+  logger?: SoapLogger;
+}
+
+/**
+ * Module IDs differ between models and firmware revisions (a DSP-W215 on firmware 1.11 exposes the
+ * temperature sensor as module 2 and the power meter as module 3), so they are discovered from the device.
+ */
+export interface ModuleIds {
+  socket?: number;
+  temperature?: number;
+  power?: number;
+}
+
+interface Session {
+  privateKey: string;
+  cookie: string;
+}
+
+interface HttpResult {
+  status: number;
+  text: string;
+}
+
+function hmacMd5(key: string, data: string): string {
+  return createHmac('md5', key).update(data, 'utf8').digest('hex').toUpperCase();
+}
+
+function describeFetchError(error: unknown): string {
+  if (error instanceof Error) {
+    if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+      return 'timed out';
+    }
+
+    const cause = (error as {cause?: {code?: string; message?: string}}).cause;
+    return cause?.code ?? cause?.message ?? error.message;
+  }
+
+  return String(error);
+}
 
 export class SoapClient {
+  private readonly url: string;
   private readonly username: string;
-  private readonly password?: string;
-  private readonly url?: string;
-  private auth = {result: '', challenge: '', publicKey: '', cookie: '', privateKey: ''};
-  private authTries = 0;
+  private readonly password: string;
+  private readonly timeoutMs: number;
+  private readonly logger?: SoapLogger;
 
-  public logError?: (message) => void;
-  public logInfo?: (message) => void;
-  public logDebug?: (message) => void;
+  private session?: Session;
+  private queue: Promise<void> = Promise.resolve();
 
-  constructor(url: string, password: string, username: string = 'admin', autoLogin: boolean = false) {
-    this.username = username;
-    this.password = password;
-    this.url = url;
-
-    if (autoLogin) {
-      this.login().then();
-    }
+  constructor(options: SoapClientOptions) {
+    this.url = options.url;
+    this.password = options.password;
+    this.username = options.username || 'admin';
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.logger = options.logger;
   }
 
-  public login(): Promise<boolean> {
-    if (!this.url) {
-      throw new Error('No URL passed in constructor');
-    }
-
-    return request(HNAP_METHOD, this.url!,
-      {
-        headers: {
-          'Content-Type': 'text/xml; charset=utf-8',
-          'SOAPAction': '"' + HNAP1_XMLNS + HNAPMethod.Login + '"',
-        },
-        body: SoapClient.buildRequestBody(HNAPMethod.Login, this.loginRequest),
-      }).then((response) => {
-
-      this.saveLoginResult(response.getBody(HNAP_BODY_ENCODING));
-      const body = SoapClient.buildRequestBody(HNAPMethod.Login, this.loginParameters);
-
-      return this.soapAction(HNAPMethod.Login, body, HNAPResponse.Login).then(response => {
-        return (response === 'success');
-      }).catch(err => {
-        this._logError(err);
-        return this.login();
-      })
+  /** Forces a fresh login. Other calls log in automatically when they need to. */
+  public login(): Promise<void> {
+    return this.enqueue(async () => {
+      this.session = undefined;
+      this.session = await this.performLogin();
     });
   }
 
-  public setState(isOn: boolean) {
-    const body = SoapClient.buildRequestBody(HNAPMethod.SetState, SoapClient.buildControlParameters(1, isOn))
-    return this.soapAction(HNAPMethod.SetState, body, HNAPResponse.SetResult);
+  public async getState(): Promise<boolean> {
+    const text = await this.call(HNAPMethod.GetState, SoapClient.moduleParameters(SOCKET_MODULE_ID));
+    const status = readTag(text, 'OPStatus')?.toLowerCase();
+
+    if (status !== 'true' && status !== 'false') {
+      throw new HnapError(`Unexpected socket state: ${status}`, 'protocol');
+    }
+
+    return status === 'true';
   }
 
-  public getState(): Promise<boolean> {
-    const body = SoapClient.buildRequestBody(HNAPMethod.GetState, SoapClient.buildModuleParameters(1))
-    return this.soapAction(HNAPMethod.GetState, body, HNAPResponse.GetState).then(result => {
-      if (result === 'ERROR') {
-        if (this.authTries >= 5) {
-          throw new Error('Maximum login attempts exceeded');
-        } else {
-          this.authTries += 1;
-          return this.getState();
+  public async setState(isOn: boolean): Promise<void> {
+    await this.call(
+      HNAPMethod.SetState,
+      SoapClient.moduleParameters(SOCKET_MODULE_ID) +
+        '<NickName>Socket 1</NickName><Description>Socket 1</Description>' +
+        `<OPStatus>${isOn}</OPStatus><Controller>1</Controller>`,
+    );
+  }
+
+  /** Current temperature in degrees Celsius. */
+  public async getTemperature(moduleId: number): Promise<number> {
+    const text = await this.call(HNAPMethod.GetTemperature, SoapClient.moduleParameters(moduleId));
+    return SoapClient.readNumber(text, 'CurrentTemperature');
+  }
+
+  /** Current power draw in watts. */
+  public async getPowerConsumption(moduleId: number): Promise<number> {
+    const text = await this.call(HNAPMethod.GetPowerConsumption, SoapClient.moduleParameters(moduleId));
+    return SoapClient.readNumber(text, 'CurrentConsumption');
+  }
+
+  public async getDeviceInfo(): Promise<DeviceInfo> {
+    const text = await this.call(HNAPMethod.GetDeviceSettings);
+
+    return {
+      name: readTag(text, 'DeviceName') || undefined,
+      vendor: readTag(text, 'VendorName') || undefined,
+      model: readTag(text, 'ModelName') || undefined,
+      macAddress: readTag(text, 'DeviceMacId') || undefined,
+      firmwareVersion: readTag(text, 'FirmwareVersion') || undefined,
+      hardwareVersion: readTag(text, 'HardwareVersion') || undefined,
+    };
+  }
+
+  /** Finds which module provides the socket, temperature sensor and power meter. */
+  public async discoverModules(): Promise<ModuleIds> {
+    const text = await this.call(HNAPMethod.GetModuleSOAPActions, SoapClient.moduleParameters(0));
+    const modules: ModuleIds = {};
+
+    for (const block of readBlocks(text, 'SOAPActions')) {
+      const id = parseInt(readTag(block, 'ModuleID') ?? '', 10);
+
+      if (Number.isNaN(id)) {
+        continue;
+      }
+
+      if (block.includes(`>${HNAPMethod.GetState}<`)) {
+        modules.socket ??= id;
+      }
+
+      if (block.includes(`>${HNAPMethod.GetTemperature}<`)) {
+        modules.temperature ??= id;
+      }
+
+      if (block.includes(`>${HNAPMethod.GetPowerConsumption}<`)) {
+        modules.power ??= id;
+      }
+    }
+
+    return modules;
+  }
+
+  /**
+   * The plug is a tiny embedded web server, so requests are sent strictly one at a time.
+   */
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(task);
+    this.queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private call(method: HNAPMethod, parameters = ''): Promise<string> {
+    return this.enqueue(async () => {
+      for (let attempt = 0; ; attempt++) {
+        if (!this.session) {
+          this.session = await this.performLogin();
         }
-      }
-      this.authTries = 0;
-      return result === 'true';
-    });
-  }
 
-  public getTemperature(): Promise<number> {
-    const body = SoapClient.buildRequestBody(HNAPMethod.GetTemperature, SoapClient.buildModuleParameters(3));
-    return this.soapAction(HNAPMethod.GetTemperature, body, HNAPResponse.Temperature).then(response => {
-      if (!!response) {
-        const parsed: number = parseFloat(response);
+        const response = await this.post(method, parameters, this.session);
 
-        if (!isNaN(parsed)) {
-          return parsed;
-        }
-      }
+        if (response.status === 401) {
+          // The plug forgot our session (reboot, timeout, ...). Log in again, but only once per call.
+          this.session = undefined;
 
-      return -99;
-    })
-  }
-
-  public getAPClientSettings() {
-    const body = SoapClient.buildRequestBody(HNAPMethod.GetAPSettings, SoapClient.buildRadioParameters('RADIO_2.4GHz'));
-    return this.soapAction(HNAPMethod.GetAPSettings, body);
-  };
-
-  public getInternetSettings(): Promise<InternetSettings | null> {
-    const body = SoapClient.buildRequestBody(HNAPMethod.GetInternetSettings);
-    return this.soapAction(HNAPMethod.GetInternetSettings, body).then((rawResponse) => {
-      const doc = new DOMParser().parseFromString(rawResponse as string);
-
-      const root = doc.getElementsByTagName('GetInternetSettingsResponse').item(0);
-
-      if (!root) {
-        return null;
-      }
-
-      const settings: InternetSettings = {
-        type: 'Unknown',
-        ipAddress: 'Unknown',
-        hostname: 'Unknown',
-        gateway: 'Unknown',
-        subnetMask: 'Unknown',
-        macAddress: 'Unknown',
-        mtu: -1,
-      };
-
-      const type = root.getElementsByTagName('Type').item(0);
-      const ipAddress = root.getElementsByTagName('IPAddress').item(0);
-      const hostname = root.getElementsByTagName('HostName').item(0);
-      const gateway = root.getElementsByTagName('Gateway').item(0);
-      const subnetMask = root.getElementsByTagName('SubnetMask').item(0);
-      const macAddress = root.getElementsByTagName('MacAddress').item(0);
-      const mtu = root.getElementsByTagName('MTU').item(0);
-
-      if (!!type && type.firstChild && !!type.firstChild.nodeValue) {
-        settings.type = type.firstChild.nodeValue;
-      }
-
-      if (!!ipAddress && ipAddress.firstChild && !!ipAddress.firstChild.nodeValue) {
-        settings.ipAddress = ipAddress.firstChild.nodeValue;
-      }
-
-      if (!!hostname && hostname.firstChild && !!hostname.firstChild.nodeValue) {
-        settings.hostname = hostname.firstChild.nodeValue;
-      }
-
-      if (!!gateway && gateway.firstChild && !!gateway.firstChild.nodeValue) {
-        settings.gateway = gateway.firstChild.nodeValue;
-      }
-
-      if (!!subnetMask && subnetMask.firstChild && !!subnetMask.firstChild.nodeValue) {
-        settings.subnetMask = subnetMask.firstChild.nodeValue;
-      }
-
-      if (!!macAddress && macAddress.firstChild && !!macAddress.firstChild.nodeValue) {
-        settings.macAddress = macAddress.firstChild.nodeValue;
-      }
-
-      if (!!mtu && mtu.firstChild && !!mtu.firstChild.nodeValue) {
-        settings.mtu = parseInt(mtu.firstChild.nodeValue);
-      }
-
-      return settings;
-    })
-  }
-
-  public isReady(): Promise<boolean> {
-    const body = SoapClient.buildRequestBody(HNAPMethod.DeviceReadiness);
-    return this.soapAction(HNAPMethod.DeviceReadiness, body, HNAPResponse.DeviceReady).then(state => {
-      return (state === 'OK');
-    })
-  }
-
-  private soapAction(method: HNAPMethod, body: any, responseElement: HNAPResponse | null = null) {
-    return request(HNAP_METHOD, this.url || '',
-      {
-        headers: {
-          'Content-Type': 'text/xml; charset=utf-8',
-          'SOAPAction': '"' + HNAP1_XMLNS + method + '"',
-          'HNAP_AUTH': SoapClient.getAuthenticationParams('"' + HNAP1_XMLNS + method + '"', this.auth.privateKey),
-          'Cookie': 'uid=' + this.auth.cookie,
-        },
-        body: body,
-      })
-      .then((response) => {
-          this._logDebug(response.getBody(HNAP_BODY_ENCODING))
-
-          if (!!responseElement && responseElement.length > 0) {
-            return SoapClient.readResponseValue(response.getBody(HNAP_BODY_ENCODING), responseElement);
+          if (attempt === 0) {
+            this.logger?.debug(`${method}: session rejected, logging in again`);
+            continue;
           }
 
-          this.isReady().then(ready => {
-            this._logInfo(`This device ${ready ? 'is' : 'is NOT'} ready`);
-          });
-
-          return response.getBody(HNAP_BODY_ENCODING);
-        },
-      ).catch((err) => {
-        if (method !== HNAPMethod.Login) {
-          return this.login().then(didLogin => {
-            if (didLogin) {
-              return this.soapAction(method, body, responseElement);
-            } else {
-              this._logDebug('Attempted to re-authenticate but did not succeed');
-              this._logError(err);
-            }
-          })
-        } else {
-          this._logError(err);
+          throw new HnapError(`${method}: still unauthorized after logging in again`, 'auth');
         }
+
+        if (response.status !== 200) {
+          throw new HnapError(`${method} failed with HTTP ${response.status}`, 'protocol');
+        }
+
+        this.logger?.debug(`${method} <- ${response.text.slice(0, MAX_LOGGED_BODY)}`);
+
+        const result = readTag(response.text, `${method}Result`);
+        if (result !== undefined && result !== 'OK') {
+          throw new HnapError(`${method} was not accepted by the plug (result: ${result})`, 'protocol');
+        }
+
+        return response.text;
+      }
+    });
+  }
+
+  private async performLogin(): Promise<Session> {
+    this.logger?.debug('Logging in');
+    const username = escapeXml(this.username);
+
+    const first = await this.post(
+      HNAPMethod.Login,
+      `<Action>request</Action><Username>${username}</Username><LoginPassword></LoginPassword><Captcha></Captcha>`,
+    );
+
+    if (first.status !== 200) {
+      throw new HnapError(`Login request failed with HTTP ${first.status}`, 'protocol');
+    }
+
+    const challenge = readTag(first.text, 'Challenge');
+    const cookie = readTag(first.text, 'Cookie');
+    const publicKey = readTag(first.text, 'PublicKey');
+
+    if (!challenge || !cookie || !publicKey) {
+      throw new HnapError('The plug did not send a login challenge', 'protocol');
+    }
+
+    const privateKey = hmacMd5(publicKey + this.password, challenge);
+    const session: Session = {privateKey, cookie};
+
+    const second = await this.post(
+      HNAPMethod.Login,
+      '<Action>login</Action>' +
+        `<Username>${username}</Username>` +
+        `<LoginPassword>${hmacMd5(privateKey, challenge)}</LoginPassword>` +
+        '<Captcha></Captcha>',
+      session,
+    );
+
+    if (second.status === 200 && readTag(second.text, 'LoginResult')?.toLowerCase() === 'success') {
+      return session;
+    }
+
+    if (second.status === 200 || second.status === 401) {
+      throw new HnapError('Login rejected by the plug - check the username and PIN', 'auth');
+    }
+
+    throw new HnapError(`Login failed with HTTP ${second.status}`, 'protocol');
+  }
+
+  private async post(method: HNAPMethod, parameters: string, session?: Session): Promise<HttpResult> {
+    const action = `"${HNAP1_XMLNS}${method}"`;
+    const headers: Record<string, string> = {
+      'Content-Type': 'text/xml; charset=utf-8',
+      SOAPAction: action,
+    };
+
+    if (session) {
+      const timestamp = Math.round(Date.now() / 1000);
+      headers.HNAP_AUTH = `${hmacMd5(session.privateKey, `${timestamp}${action}`)} ${timestamp}`;
+      headers.Cookie = `uid=${session.cookie}`;
+    }
+
+    try {
+      const response = await fetch(this.url, {
+        method: 'POST',
+        headers,
+        body: SoapClient.buildRequestBody(method, parameters),
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
-  }
 
-  private saveLoginResult(body) {
-    const doc = new DOMParser().parseFromString(body);
-
-    const authResult = doc.getElementsByTagName('LoginResult').item(0);
-    const challenge = doc.getElementsByTagName('Challenge').item(0);
-    const publicKey = doc.getElementsByTagName('PublicKey').item(0);
-    const cookie = doc.getElementsByTagName('Cookie').item(0);
-    const privateKey = doc.getElementsByTagName('Cookie').item(0);
-
-    if (!!authResult && !!authResult.firstChild && !!authResult.firstChild.nodeValue) {
-      this.auth.result = authResult.firstChild.nodeValue;
-    }
-
-    if (!!challenge && !!challenge.firstChild && !!challenge.firstChild.nodeValue) {
-      this.auth.challenge = challenge.firstChild.nodeValue;
-    }
-
-    if (!!publicKey && !!publicKey.firstChild && !!publicKey.firstChild.nodeValue) {
-      this.auth.publicKey = publicKey.firstChild.nodeValue;
-    }
-
-    if (!!cookie && !!cookie.firstChild && !!cookie.firstChild.nodeValue) {
-      this.auth.cookie = cookie.firstChild.nodeValue;
-    }
-
-    if (!!privateKey && !!privateKey.firstChild && !!privateKey.firstChild.nodeValue) {
-      this.auth.privateKey = HMACMD5.hex_hmac_md5(this.auth.publicKey + this.password, this.auth.challenge).toUpperCase();
+      return {status: response.status, text: await response.text()};
+    } catch (error) {
+      throw new HnapError(`${method} request failed: ${describeFetchError(error)}`, 'network');
     }
   }
 
-  private _logError(message: any) {
-    if (!!this.logError) {
-      this.logError(message);
-    } else {
-      console.error(message);
+  private static readNumber(text: string, tag: string): number {
+    const raw = readTag(text, tag);
+    const value = raw === undefined || raw === '' ? NaN : parseFloat(raw);
+
+    if (Number.isNaN(value)) {
+      throw new HnapError(`Missing or invalid <${tag}> in response`, 'protocol');
     }
+
+    return value;
   }
 
-  private _logInfo(message: any) {
-    if (!!this.logInfo) {
-      this.logInfo(message);
-    } else {
-      console.log(message);
-    }
-  }
-
-  private _logDebug(message: any) {
-    if (!!this.logDebug) {
-      this.logDebug(message);
-    } else {
-      console.debug(message);
-    }
-  }
-
-  private get loginRequest() {
-    return '<Action>request</Action>'
-      + '<Username>' + this.username + '</Username>'
-      + '<LoginPassword></LoginPassword>'
-      + '<Captcha></Captcha>';
-  }
-
-  private get loginParameters() {
-    const login_pwd = HMACMD5.hex_hmac_md5(this.auth.privateKey, this.auth.challenge);
-    return '<Action>login</Action>'
-      + '<Username>' + this.username + '</Username>'
-      + '<LoginPassword>' + login_pwd.toUpperCase() + '</LoginPassword>'
-      + '<Captcha></Captcha>';
-  }
-
-  private static readResponseValue(body: any, elementName: string) {
-    if (body && elementName) {
-      const doc = new DOMParser().parseFromString(body);
-      const node = doc.getElementsByTagName(elementName).item(0);
-      return (node && node.firstChild) ? node.firstChild.nodeValue : 'ERROR';
-    }
-  }
-
-  private static getAuthenticationParams(soapAction: string, privateKey: string) {
-    const currentTime = new Date();
-    const timestamp = Math.round(currentTime.getTime() / 1000);
-    const auth = HMACMD5.hex_hmac_md5(privateKey, timestamp + soapAction);
-    return auth.toUpperCase() + ' ' + timestamp;
-  }
-
-  private static buildRequestBody(method: HNAPMethod, parameters: any = '') {
-    return '<?xml version="1.0" encoding="utf-8"?>' +
+  private static buildRequestBody(method: HNAPMethod, parameters: string): string {
+    return (
+      '<?xml version="1.0" encoding="utf-8"?>' +
       '<soap:Envelope ' +
       'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ' +
       'xmlns:xsd="http://www.w3.org/2001/XMLSchema" ' +
       'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">' +
       '<soap:Body>' +
-      '<' + method + ' xmlns="' + HNAP1_XMLNS + '">' +
-      parameters +
-      '</' + method + '>' +
-      '</soap:Body></soap:Envelope>';
+      `<${method} xmlns="${HNAP1_XMLNS}">${parameters}</${method}>` +
+      '</soap:Body></soap:Envelope>'
+    );
   }
 
-  private static buildRadioParameters(radio: string) {
-    return '<RadioID>' + radio + '</RadioID>';
-  }
-
-  private static buildModuleParameters(module: number) {
-    return '<ModuleID>' + module + '</ModuleID>';
-  }
-
-  private static buildControlParameters(module: number, status: boolean) {
-    return this.buildModuleParameters(module) +
-      '<NickName>Socket 1</NickName><Description>Socket 1</Description>' +
-      '<OPStatus>' + status + '</OPStatus><Controller>1</Controller>';
+  private static moduleParameters(moduleId: number): string {
+    return `<ModuleID>${moduleId}</ModuleID>`;
   }
 }

@@ -3,7 +3,8 @@ export enum HNAPMethod {
   GetState = 'GetSocketSettings',
   SetState = 'SetSocketSettings',
   GetTemperature = 'GetCurrentTemperature',
-  GetAPSettings = 'GetAPClientSettings',
-  GetInternetSettings = 'GetInternetSettings',
-  DeviceReadiness = 'IsDeviceReady'
+  GetPowerConsumption = 'GetCurrentPowerConsumption',
+  GetDeviceSettings = 'GetDeviceSettings',
+  GetModuleSOAPActions = 'GetModuleSOAPActions',
+  DeviceReadiness = 'IsDeviceReady',
 }

@@ -43,6 +43,7 @@
     },
     "keywords": [
         "homebridge-plugin",
+        "supports-hap",
         "D-Link",
         "dlink",
         "w215",

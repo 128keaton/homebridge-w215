@@ -1,7 +1,7 @@
 {
     "name": "homebridge-w215-kb",
     "displayName": "D-Link W215 Smart Plug",
-    "version": "1.0.7",
+    "version": "1.0.9",
     "description": "Homebridge plugin for the D-Link DSP-W215 smart plug (switch, temperature and power meter)",
     "type": "module",
     "main": "dist/accessory.js",
